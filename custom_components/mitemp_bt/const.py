@@ -17,6 +17,7 @@ CONF_REPORT_UNKNOWN = "report_unknown"
 CONF_WHITELIST = "whitelist"
 CONF_SENSOR_NAMES = "sensor_names"
 CONF_SENSOR_FAHRENHEIT = "sensor_fahrenheit"
+CONF_PRESENCE_SENSOR_NAMES = "presence_sensor_names"
 
 # Default values for configuration options
 DEFAULT_ROUNDING = True

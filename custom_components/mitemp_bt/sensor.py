@@ -1,5 +1,6 @@
 """Xiaomi passive BLE monitor integration."""
 import asyncio
+from datetime import datetime
 from datetime import timedelta
 import logging
 import statistics as sts
@@ -56,6 +57,7 @@ from .const import (
     CONF_WHITELIST,
     CONF_SENSOR_NAMES,
     CONF_SENSOR_FAHRENHEIT,
+    CONF_PRESENCE_SENSOR_NAMES,
     CONF_TMIN,
     CONF_TMAX,
     CONF_HMIN,
@@ -73,6 +75,7 @@ MAC_REGEX = "(?i)^(?:[0-9A-F]{2}[:]){5}(?:[0-9A-F]{2})$"
 AES128KEY_REGEX = "(?i)^[A-F0-9]{32}$"
 
 SENSOR_NAMES_LIST_SCHEMA = vol.Schema({cv.matches_regex(MAC_REGEX): cv.string})
+PRESENCE_SENSOR_NAMES_LIST_SCHEMA = vol.Schema({cv.matches_regex(MAC_REGEX): cv.string})
 
 ENCRYPTORS_LIST_SCHEMA = vol.Schema(
     {cv.matches_regex(MAC_REGEX): cv.matches_regex(AES128KEY_REGEX)}
@@ -103,6 +106,7 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Optional(CONF_SENSOR_FAHRENHEIT, default=[]): vol.All(
             cv.ensure_list, [cv.matches_regex(MAC_REGEX)]
         ),
+        vol.Optional(CONF_PRESENCE_SENSOR_NAMES, default={}): PRESENCE_SENSOR_NAMES_LIST_SCHEMA,
     }
 )
 
@@ -232,6 +236,23 @@ def decrypt_payload(encrypted_payload, key, nonce):
         _LOGGER.error("cipherpayload: %s", cipherpayload.hex())
         return None
     return plaindata
+
+
+def parse_presence(data):
+    hci_event = aiobs.HCI_Event()
+    hci_event.decode(data)
+    
+    result = {
+        "type": "presence"
+    }
+    mac = next(iter([x.val for x in hci_event.retrieve(aiobs.MACAddr)]), None)
+    if mac:
+        result["mac"] = mac
+        rssi = next(iter([x.val for x in hci_event.retrieve(aiobs.IntByte) if x.name == 'rssi']), None)
+        if rssi:
+            result["rssi"] = rssi
+        return result
+    return None
 
 
 def parse_raw_message(data, aeskeyslist, whitelist, report_unknown=False):
@@ -458,6 +479,43 @@ class BLEScanner:
         self.stop()
 
 
+class PresenceManager:
+    """Presence Manager"""
+    
+    last_seen_entities = {}
+    
+    def __init__(self, hass, config):
+        self.hass = hass
+        # TODO make consider_home configurable
+        self.consider_home = timedelta(seconds=180)
+        # store presence name mapping
+        self.presence_names = {}
+        for mac in config[CONF_PRESENCE_SENSOR_NAMES]:
+            self.presence_names[mac.lower()] = config[CONF_PRESENCE_SENSOR_NAMES].get(mac)
+    
+    def add_presence(self, presence):
+        if presence and "mac" in presence:
+            entity_name = self.presence_names.get(presence["mac"].lower())
+            if entity_name:
+                self.last_seen_entities[entity_name] = self.now()
+                return True
+        return False
+    
+    def push_presence_state(self):
+        for entity_name in self.last_seen_entities:
+            last_seen = self.last_seen_entities[entity_name]
+            at_home = True if last_seen + self.consider_home > self.now() else False
+            data = {
+                "dev_id": entity_name,
+                "location_name": "home" if at_home else "not_home",
+                "consider_home": self.consider_home
+            }
+            self.hass.services.call("device_tracker", "see", data, False)
+
+    def now(self):
+        return datetime.utcnow()
+
+
 def setup_platform(hass, config, add_entities, discovery_info=None):
     """Set up the sensor platform."""
 
@@ -516,6 +574,9 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
         whitelist[i] = bytes.fromhex(reverse_mac(mac.replace(":", "")).lower())
     _LOGGER.debug("%s whitelist item(s) loaded.", len(whitelist))
     lpacket.cntr = {}
+    
+    presence_manager = PresenceManager(hass, config)
+
     sleep(1)
 
     def calc_update_state(
@@ -605,6 +666,9 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
         scanner.start(config)  # minimum delay between HCIdumps
         report_unknown = config[CONF_REPORT_UNKNOWN]
         for msg in hcidump_raw:
+            presence = parse_presence(msg)
+            if presence_manager.add_presence(presence):
+                continue
             data = parse_raw_message(msg, aeskeyslist, whitelist, report_unknown)
             if data and "mac" in data:
                 # ignore duplicated message
@@ -836,6 +900,7 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
                         "Sensor %s (%s, switch) update error:", mac, sensortype
                     )
                     _LOGGER.error(err)
+        presence_manager.push_presence_state()
         _LOGGER.debug(
             "Finished. Parsed: %i hci events, %i xiaomi devices.",
             len(hcidump_raw),
